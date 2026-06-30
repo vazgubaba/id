@@ -122,48 +122,49 @@ function createEmbed(guild, { title, description, fields, image }) {
   return e;
 }
 
-// ===================== FIVEM API (resmi Cfx.re endpoint, doğrudan fetch) =====================
+// ===================== FIVEM API (doğrudan sunucu IP:PORT, retry + uzun timeout) =====================
 let lastPlayersFetchAt = 0;
 let cachedServerData = null;
+const CACHE_TTL_MS = 15000; // 15 sn (eskisi 30sn idi, daha güncel veri için düşürüldü)
+const FETCH_TIMEOUT_MS = 20000; // 20 sn (eskisi 10sn idi, yavaş sunucu cevaplarını yakalamak için artırıldı)
 
 function cleanFiveMName(name = "") {
   return String(name).replace(/\^\d/g, "").toLowerCase();
 }
 
-// Eski "fivem-server-api" paketi, FiveM'in resmi servers-frontend endpoint'ini
-// Cloudflare botu korumasından geçmeyen çıplak bir istekle çağırıyordu, bu yüzden
-// 403/404 alıp veri çekemiyordu. Aşağıdaki fonksiyon önce sunucunun kendi
-// IP:PORT adresinden (Cloudflare'siz, en güvenilir yöntem) veri çekmeyi dener,
-// olmazsa Cfx.re'nin servers-frontend endpoint'ine tarayıcı gibi görünen
-// header'larla düşer.
-
-async function fetchDirectFromServer(ipPort, timeoutMs = 10000) {
+async function fetchDirectFromServer(ipPort, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const [playersRes, infoRes] = await Promise.all([
-      fetch(`http://${ipPort}/players.json`, { signal: controller.signal }),
-      fetch(`http://${ipPort}/info.json`, { signal: controller.signal }).catch(() => null)
-    ]);
+    const playersRes = await fetch(`http://${ipPort}/players.json`, {
+      signal: controller.signal
+    });
 
     if (!playersRes.ok) {
       throw new Error(`/players.json HTTP ${playersRes.status}`);
     }
 
     const players = await playersRes.json();
+
+    // info.json opsiyonel, ayrı timeout ile ve hata olursa sessizce yutuyoruz
     let hostname = ipPort;
     let svMaxclients = 0;
-
-    if (infoRes && infoRes.ok) {
-      try {
+    try {
+      const infoController = new AbortController();
+      const infoTimer = setTimeout(() => infoController.abort(), 5000);
+      const infoRes = await fetch(`http://${ipPort}/info.json`, {
+        signal: infoController.signal
+      }).finally(() => clearTimeout(infoTimer));
+      if (infoRes && infoRes.ok) {
         const info = await infoRes.json();
         hostname = info?.vars?.sv_projectName || info?.hostname || ipPort;
         svMaxclients = Number(info?.vars?.sv_maxClients) || 0;
-      } catch (_) {}
+      }
+    } catch (_) {
+      // info.json alınamazsa önemli değil, players.json yeterli
     }
 
-    // getServerPlayersCached() ile uyumlu olması için aynı Data.players yapısına sarıyoruz
     return {
       EndPoint: ipPort,
       Data: {
@@ -178,73 +179,34 @@ async function fetchDirectFromServer(ipPort, timeoutMs = 10000) {
   }
 }
 
-async function fetchFiveMServerRaw(code, timeoutMs = 10000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  const cleanCode = String(code).trim();
-  const url = `https://servers-frontend.fivem.net/api/servers/single/${cleanCode}`;
-
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        Accept: "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        Referer: "https://servers.fivem.net/",
-        Origin: "https://servers.fivem.net"
-      }
-    });
-
-    if (!res.ok) {
-      const bodyText = await res.text().catch(() => "(gövde okunamadı)");
+// Aynı isteği 1 kez daha dener (ilk deneme timeout/aborted olursa)
+async function fetchDirectFromServerWithRetry(ipPort, retries = 1) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fetchDirectFromServer(ipPort);
+    } catch (err) {
+      lastErr = err;
       console.error(
-        `❌ FiveM API HATA -> URL: ${url} | Status: ${res.status} | Body: ${bodyText.slice(0, 300)}`
+        `⚠️ Doğrudan IP:PORT (${ipPort}) deneme ${attempt + 1}/${retries + 1} başarısız: ${err.message}`
       );
-      throw new Error(`FiveM API HTTP ${res.status}`);
     }
-
-    const json = await res.json();
-    return json;
-  } finally {
-    clearTimeout(timer);
   }
+  throw lastErr;
 }
 
 async function getServerPlayersCached() {
   const now = Date.now();
 
-  if (cachedServerData && now - lastPlayersFetchAt < 30000) {
+  if (cachedServerData && now - lastPlayersFetchAt < CACHE_TTL_MS) {
     return cachedServerData;
   }
 
-  let result;
-  let lastErr;
-
-  // 1) Önce doğrudan sunucudan (IP:PORT) çekmeyi dene - en güvenilir yöntem
-  if (SERVER_IP_PORT) {
-    try {
-      result = await fetchDirectFromServer(SERVER_IP_PORT, 10000);
-    } catch (err) {
-      lastErr = err;
-      console.error(`⚠️ Doğrudan IP:PORT (${SERVER_IP_PORT}) ile çekilemedi: ${err.message}`);
-    }
-  }
-
-  // 2) Olmazsa Cfx.re CFX kod endpoint'ine düş
-  if (!result) {
-    try {
-      result = await fetchFiveMServerRaw(CFX_CODE, 10000);
-    } catch (err) {
-      lastErr = err;
-    }
-  }
+  const result = await fetchDirectFromServerWithRetry(SERVER_IP_PORT, 1);
 
   if (!result || !result.Data) {
     throw new Error(
-      `Sunucu bulunamadı. IP:PORT (${SERVER_IP_PORT}) ya da CFX kodu (${CFX_CODE}) yanlış olabilir, sunucu offline ya da FiveM API geçici olarak erişilemiyor. (${lastErr?.message || "bilinmeyen hata"})`
+      `Sunucu bulunamadı. IP:PORT (${SERVER_IP_PORT}) adresine ulaşılamıyor ya da sunucu offline.`
     );
   }
 

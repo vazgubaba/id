@@ -60,8 +60,14 @@ const THUMB_URL = (process.env.THUMB_URL || BOT_IMAGE_URL).trim();
 const PANEL_AUTHOR = (process.env.PANEL_AUTHOR || "vazgucxn Assistant").trim();
 const FOOTER_TEXT = (process.env.FOOTER_TEXT || "Quantès • Assistant").trim();
 
-// FiveM CFX kodu (Render ENV: CFX_CODE)
+// FiveM CFX kodu (Render ENV: CFX_CODE) - yedek yöntem (Cloudflare engelleyebilir)
 const CFX_CODE = (process.env.CFX_CODE || "xjx5kr").trim();
+
+// Sunucunun doğrudan IP:PORT adresi (Railway ENV: SERVER_IP_PORT)
+// Bu yöntem Cfx.re'nin Cloudflare korumalı endpoint'ini hiç kullanmaz,
+// doğrudan sunucunun kendi /players.json ve /info.json adreslerinden veri çeker.
+// Sunucu sahibi bu endpoint'leri kapatmadıysa (sv_endpointprivacy false ise) çalışır.
+const SERVER_IP_PORT = (process.env.SERVER_IP_PORT || "5.231.120.202:30120").trim();
 
 // Tema renk
 const NAVY = 0x0b1a3a;
@@ -126,29 +132,77 @@ function cleanFiveMName(name = "") {
 
 // Eski "fivem-server-api" paketi, FiveM'in resmi servers-frontend endpoint'ini
 // Cloudflare botu korumasından geçmeyen çıplak bir istekle çağırıyordu, bu yüzden
-// 403 alıp veri çekemiyordu. Aşağıdaki fonksiyon aynı endpoint'e gerçek bir tarayıcı
-// gibi görünen header'larla (User-Agent, Accept, Referer) doğrudan istek atar.
-async function fetchFiveMServerRaw(code, timeoutMs = 10000) {
+// 403/404 alıp veri çekemiyordu. Aşağıdaki fonksiyon önce sunucunun kendi
+// IP:PORT adresinden (Cloudflare'siz, en güvenilir yöntem) veri çekmeyi dener,
+// olmazsa Cfx.re'nin servers-frontend endpoint'ine tarayıcı gibi görünen
+// header'larla düşer.
+
+async function fetchDirectFromServer(ipPort, timeoutMs = 10000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(
-      `https://servers-frontend.fivem.net/api/servers/single/${code}`,
-      {
-        signal: controller.signal,
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          Accept: "application/json, text/plain, */*",
-          "Accept-Language": "en-US,en;q=0.9",
-          Referer: "https://servers.fivem.net/",
-          Origin: "https://servers.fivem.net"
-        }
+    const [playersRes, infoRes] = await Promise.all([
+      fetch(`http://${ipPort}/players.json`, { signal: controller.signal }),
+      fetch(`http://${ipPort}/info.json`, { signal: controller.signal }).catch(() => null)
+    ]);
+
+    if (!playersRes.ok) {
+      throw new Error(`/players.json HTTP ${playersRes.status}`);
+    }
+
+    const players = await playersRes.json();
+    let hostname = ipPort;
+    let svMaxclients = 0;
+
+    if (infoRes && infoRes.ok) {
+      try {
+        const info = await infoRes.json();
+        hostname = info?.vars?.sv_projectName || info?.hostname || ipPort;
+        svMaxclients = Number(info?.vars?.sv_maxClients) || 0;
+      } catch (_) {}
+    }
+
+    // getServerPlayersCached() ile uyumlu olması için aynı Data.players yapısına sarıyoruz
+    return {
+      EndPoint: ipPort,
+      Data: {
+        hostname,
+        clients: Array.isArray(players) ? players.length : 0,
+        svMaxclients,
+        players: Array.isArray(players) ? players : []
       }
-    );
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchFiveMServerRaw(code, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const cleanCode = String(code).trim();
+  const url = `https://servers-frontend.fivem.net/api/servers/single/${cleanCode}`;
+
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Accept: "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        Referer: "https://servers.fivem.net/",
+        Origin: "https://servers.fivem.net"
+      }
+    });
 
     if (!res.ok) {
+      const bodyText = await res.text().catch(() => "(gövde okunamadı)");
+      console.error(
+        `❌ FiveM API HATA -> URL: ${url} | Status: ${res.status} | Body: ${bodyText.slice(0, 300)}`
+      );
       throw new Error(`FiveM API HTTP ${res.status}`);
     }
 
@@ -167,16 +221,31 @@ async function getServerPlayersCached() {
   }
 
   let result;
-  try {
-    result = await fetchFiveMServerRaw(CFX_CODE, 10000);
-  } catch (err) {
-    throw new Error(
-      `Sunucu bulunamadı (CFX kodu: ${CFX_CODE}). Kod yanlış olabilir, sunucu offline ya da FiveM API geçici olarak erişilemiyor. (${err.message})`
-    );
+  let lastErr;
+
+  // 1) Önce doğrudan sunucudan (IP:PORT) çekmeyi dene - en güvenilir yöntem
+  if (SERVER_IP_PORT) {
+    try {
+      result = await fetchDirectFromServer(SERVER_IP_PORT, 10000);
+    } catch (err) {
+      lastErr = err;
+      console.error(`⚠️ Doğrudan IP:PORT (${SERVER_IP_PORT}) ile çekilemedi: ${err.message}`);
+    }
+  }
+
+  // 2) Olmazsa Cfx.re CFX kod endpoint'ine düş
+  if (!result) {
+    try {
+      result = await fetchFiveMServerRaw(CFX_CODE, 10000);
+    } catch (err) {
+      lastErr = err;
+    }
   }
 
   if (!result || !result.Data) {
-    throw new Error(`Sunucu bulunamadı (CFX kodu: ${CFX_CODE}). Kod yanlış olabilir ya da sunucu offline.`);
+    throw new Error(
+      `Sunucu bulunamadı. IP:PORT (${SERVER_IP_PORT}) ya da CFX kodu (${CFX_CODE}) yanlış olabilir, sunucu offline ya da FiveM API geçici olarak erişilemiyor. (${lastErr?.message || "bilinmeyen hata"})`
+    );
   }
 
   cachedServerData = result;

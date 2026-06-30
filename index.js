@@ -19,17 +19,7 @@ const {
 } = require("discord.js");
 
 const { joinVoiceChannel } = require("@discordjs/voice");
-
-// ===================== FETCH (Node 18+ global) fallback =====================
-let _fetch = global.fetch;
-if (!_fetch) {
-  try {
-    _fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-  } catch (e) {
-    console.error("❌ fetch yok! Node 18+ kullan veya node-fetch kur.");
-    process.exit(1);
-  }
-}
+const { getServerByEndpoint } = require("fivem-server-api");
 
 // ===================== ENV / TOKEN =====================
 const TOKEN = (
@@ -127,23 +117,9 @@ function createEmbed(guild, { title, description, fields, image }) {
   return e;
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await _fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ===================== FIVEM API =====================
+// ===================== FIVEM API (fivem-server-api paketi ile) =====================
 let lastPlayersFetchAt = 0;
-let cachedPlayersJson = null;
+let cachedServerData = null;
 
 function cleanFiveMName(name = "") {
   return String(name).replace(/\^\d/g, "").toLowerCase();
@@ -152,37 +128,25 @@ function cleanFiveMName(name = "") {
 async function getServerPlayersCached() {
   const now = Date.now();
 
-  if (cachedPlayersJson && now - lastPlayersFetchAt < 30000) {
-    return cachedPlayersJson;
+  if (cachedServerData && now - lastPlayersFetchAt < 30000) {
+    return cachedServerData;
   }
 
-  const url = `https://servers-frontend.fivem.net/api/servers/single/${CFX_CODE}`;
+  const result = await getServerByEndpoint(CFX_CODE, 10000);
 
-  const res = await fetchWithTimeout(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Accept": "application/json, text/plain, */*",
-      "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-      "Referer": "https://servers.fivem.net/",
-      "Origin": "https://servers.fivem.net"
-    }
-  }, 5000);
-
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+  if (!result) {
+    throw new Error(`Sunucu bulunamadı (CFX kodu: ${CFX_CODE}). Kod yanlış olabilir ya da sunucu offline.`);
   }
 
-  const json = await res.json();
-
-  cachedPlayersJson = json;
+  cachedServerData = result;
   lastPlayersFetchAt = now;
 
-  return json;
+  return result;
 }
 
 async function getPlayerFromCFX(playerId) {
-  const json = await getServerPlayersCached();
-  const players = json?.Data?.players || [];
+  const result = await getServerPlayersCached();
+  const players = result?.Data?.players || [];
   const p = players.find((x) => String(x.id) === String(playerId));
   if (!p) return { found: false };
 

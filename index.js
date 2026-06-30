@@ -1,6 +1,6 @@
-// ===================== MINI BOT: ID • TAG • SESGİR =====================
-// discord.js v14 | PREFIX (.)
-// Sadece 3 komut: .id <oyuncuID>  |  .tag <isim>  |  .sesgir
+// ===================== MINI BOT: ID • TAG • SESGİR (SLASH KOMUT) =====================
+// discord.js v14 | Slash Commands (/)
+// Sadece 3 komut: /id <oyuncuid>  |  /tag <isim>  |  /sesgir
 // Senin özel emoji setin korunmuştur.
 // ==========================================================================
 process.on("unhandledRejection", (r) => console.error("UNHANDLED_REJECTION:", r));
@@ -12,7 +12,10 @@ const {
   Client,
   GatewayIntentBits,
   Partials,
-  EmbedBuilder
+  EmbedBuilder,
+  REST,
+  Routes,
+  SlashCommandBuilder
 } = require("discord.js");
 
 const { joinVoiceChannel } = require("@discordjs/voice");
@@ -41,6 +44,15 @@ if (!TOKEN) {
   process.exit(1);
 }
 
+// CLIENT_ID: slash komutları kaydetmek için Discord Application ID gerekiyor.
+// Render ENV'e DISCORD_CLIENT_ID ekleyebilirsin, eklemezsen bot login olduktan
+// sonra client.user.id'den otomatik çeker (ekstra ayara gerek kalmaz).
+let CLIENT_ID = (process.env.DISCORD_CLIENT_ID || process.env.CLIENT_ID || "").trim();
+
+// GUILD_ID verirsen komutlar SADECE o sunucuda anında görünür (test için ideal).
+// Boş bırakırsan komutlar GLOBAL olur, Discord'da yayılması ~1 saat sürebilir.
+const GUILD_ID = (process.env.DISCORD_GUILD_ID || process.env.GUILD_ID || "").trim();
+
 // ===================== Render Keep-Alive =====================
 const app = express();
 app.get("/", (req, res) => res.status(200).send("OK"));
@@ -48,8 +60,6 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, "0.0.0.0", () => console.log("🌐 Web aktif:", PORT));
 
 // ===================== AYARLAR =====================
-const PREFIX = ".";
-
 // Görsel TEK NOKTA (istersen Render ENV üzerinden değiştir)
 const BOT_IMAGE_URL =
   (process.env.BOT_IMAGE_URL || process.env.BOT_IMAGE || "").trim() ||
@@ -115,9 +125,6 @@ function createEmbed(guild, { title, description, fields, image }) {
   if (fields?.length) e.addFields(fields);
   if (image) e.setImage(image);
   return e;
-}
-async function replyE(message, embed) {
-  return message.reply({ embeds: [embed] }).catch(() => {});
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
@@ -190,118 +197,129 @@ async function getPlayerFromCFX(playerId) {
   };
 }
 
+// ===================== SLASH KOMUT TANIMLARI =====================
+const commands = [
+  new SlashCommandBuilder()
+    .setName("id")
+    .setDescription("FiveM sunucusundaki bir oyuncuyu ID'sine göre sorgular")
+    .addIntegerOption((opt) =>
+      opt
+        .setName("oyuncuid")
+        .setDescription("Sunucu içi oyuncu ID'si (örn. 12)")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("tag")
+    .setDescription("FiveM sunucusunda isme göre oyuncu arar")
+    .addStringOption((opt) =>
+      opt
+        .setName("isim")
+        .setDescription("Aranacak isim/parça (örn. kaisen)")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("sesgir")
+    .setDescription("Botu bulunduğun ses kanalına davet eder")
+].map((c) => c.toJSON());
+
+async function registerCommands(clientId) {
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+
+  try {
+    if (GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(clientId, GUILD_ID), {
+        body: commands
+      });
+      console.log(`✅ Slash komutlar GUILD'e kaydedildi (anında aktif): ${GUILD_ID}`);
+    } else {
+      await rest.put(Routes.applicationCommands(clientId), {
+        body: commands
+      });
+      console.log("✅ Slash komutlar GLOBAL kaydedildi (yayılması ~1 saat sürebilir).");
+    }
+  } catch (err) {
+    console.error("❌ Slash komut kaydı başarısız:", err);
+  }
+}
+
 // ===================== DISCORD CLIENT =====================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates
   ],
   partials: [Partials.Channel]
 });
 
-client.once("clientReady", () => {
+client.once("clientReady", async () => {
   console.log(`🟢 Bot aktif: ${client.user.tag}`);
+
+  if (!CLIENT_ID) CLIENT_ID = client.user.id;
+  await registerCommands(CLIENT_ID);
 });
 
-// ===================== PREFIX COMMANDS =====================
-client.on("messageCreate", async (message) => {
+// ===================== SLASH COMMAND HANDLER =====================
+client.on("interactionCreate", async (i) => {
   try {
-    if (!message.guild) return;
-    if (message.author.bot) return;
-    if (!message.content.startsWith(PREFIX)) return;
+    if (!i.isChatInputCommand()) return;
+    if (!i.guild) return;
 
-    const guild = message.guild;
-    const args = message.content.slice(PREFIX.length).trim().split(/ +/);
-    const cmd = args.shift().toLowerCase();
+    const guild = i.guild;
 
-    // ===================== ID (FiveM) =====================
-    if (cmd === "id") {
-      const playerId = args[0];
+    // ===================== /ID (FiveM) =====================
+    if (i.commandName === "id") {
+      await i.deferReply();
 
-      if (!playerId || isNaN(playerId)) {
-        return replyE(
-          message,
-          createEmbed(guild, {
-            title: line(EMOJI.info, "ᴋᴜʟʟᴀɴɪᴍ"),
-            description: line(EMOJI.right, `${PREFIX}id 12`)
-          })
-        );
-      }
+      const playerId = i.options.getInteger("oyuncuid");
 
       try {
         const data = await getPlayerFromCFX(playerId);
 
         if (!data.found) {
-          return replyE(
-            message,
-            createEmbed(guild, {
-              title: line(EMOJI.warn, "ʙᴜʟᴜɴᴀᴍᴀᴅɪ"),
-              description: line(EMOJI.warn, "Oyuncu bulunamadı.")
-            })
-          );
+          return i.editReply({
+            embeds: [
+              createEmbed(guild, {
+                title: line(EMOJI.warn, "ʙᴜʟᴜɴᴀᴍᴀᴅɪ"),
+                description: line(EMOJI.warn, "Oyuncu bulunamadı.")
+              })
+            ]
+          });
         }
 
-        return replyE(
-          message,
-          createEmbed(guild, {
-            title: line(EMOJI.fivem, "ꜰɪᴠᴇᴍ ᴏʏᴜɴᴄᴜ"),
-            fields: [
-              {
-                name: line(EMOJI.info, "İsim"),
-                value: `\`${data.name}\``
-              },
-              {
-                name: line(EMOJI.settings, "ID"),
-                value: `\`${data.id}\``,
-                inline: true
-              },
-              {
-                name: line(EMOJI.right, "Ping"),
-                value: `\`${data.ping}\``,
-                inline: true
-              },
-              {
-                name: line(EMOJI.search, "Steam"),
-                value: `\`${data.steam}\``
-              },
-              {
-                name: line(EMOJI.search, "Discord"),
-                value: `\`${data.discord}\``
-              }
-            ]
-          })
-        );
+        return i.editReply({
+          embeds: [
+            createEmbed(guild, {
+              title: line(EMOJI.fivem, "ꜰɪᴠᴇᴍ ᴏʏᴜɴᴄᴜ"),
+              fields: [
+                { name: line(EMOJI.info, "İsim"), value: `\`${data.name}\`` },
+                { name: line(EMOJI.settings, "ID"), value: `\`${data.id}\``, inline: true },
+                { name: line(EMOJI.right, "Ping"), value: `\`${data.ping}\``, inline: true },
+                { name: line(EMOJI.search, "Steam"), value: `\`${data.steam}\`` },
+                { name: line(EMOJI.search, "Discord"), value: `\`${data.discord}\`` }
+              ]
+            })
+          ]
+        });
       } catch (err) {
         console.error("ID CMD ERROR:", err);
-
-        return replyE(
-          message,
-          createEmbed(guild, {
-            title: line(EMOJI.warn, "ᴀᴘɪ ʜᴀᴛᴀ"),
-            description: line(
-              EMOJI.warn,
-              err?.message || "FiveM API bağlantı hatası"
-            )
-          })
-        );
+        return i.editReply({
+          embeds: [
+            createEmbed(guild, {
+              title: line(EMOJI.warn, "ᴀᴘɪ ʜᴀᴛᴀ"),
+              description: line(EMOJI.warn, err?.message || "FiveM API bağlantı hatası")
+            })
+          ]
+        });
       }
     }
 
-    // ===================== TAG (FiveM) =====================
-    if (cmd === "tag") {
-      const search = args.join(" ").trim();
+    // ===================== /TAG (FiveM) =====================
+    if (i.commandName === "tag") {
+      await i.deferReply();
 
-      if (!search) {
-        return replyE(
-          message,
-          createEmbed(guild, {
-            title: line(EMOJI.info, "ᴋᴜʟʟᴀɴɪᴍ"),
-            description: line(EMOJI.right, `${PREFIX}tag kaisen`)
-          })
-        );
-      }
+      const search = i.options.getString("isim").trim();
 
       try {
         const json = await getServerPlayersCached();
@@ -312,55 +330,56 @@ client.on("messageCreate", async (message) => {
         );
 
         if (!matched.length) {
-          return replyE(
-            message,
-            createEmbed(guild, {
-              title: line(EMOJI.warn, "ʙᴜʟᴜɴᴀᴍᴀᴅɪ"),
-              description: line(EMOJI.warn, "Oyuncu bulunamadı.")
-            })
-          );
+          return i.editReply({
+            embeds: [
+              createEmbed(guild, {
+                title: line(EMOJI.warn, "ʙᴜʟᴜɴᴀᴍᴀᴅɪ"),
+                description: line(EMOJI.warn, "Oyuncu bulunamadı.")
+              })
+            ]
+          });
         }
 
         const list = matched
           .slice(0, 25)
-          .map(
-            (p) =>
-              `${EMOJI.right} ・ **${p.name}** (ID: \`${p.id}\` | Ping: \`${p.ping}\`)`
-          )
+          .map((p) => `${EMOJI.right} ・ **${p.name}** (ID: \`${p.id}\` | Ping: \`${p.ping}\`)`)
           .join("\n");
 
-        return replyE(
-          message,
-          createEmbed(guild, {
-            title: `${EMOJI.search} ・ ᴛᴀɢ ᴀʀᴀᴍᴀ`,
-            description:
-              `${EMOJI.success} ・ Toplam: **${matched.length} kişi**\n\n` + list
-          })
-        );
+        return i.editReply({
+          embeds: [
+            createEmbed(guild, {
+              title: `${EMOJI.search} ・ ᴛᴀɢ ᴀʀᴀᴍᴀ`,
+              description: `${EMOJI.success} ・ Toplam: **${matched.length} kişi**\n\n` + list
+            })
+          ]
+        });
       } catch (err) {
-        console.error("TAG ERROR:", err);
-
-        return replyE(
-          message,
-          createEmbed(guild, {
-            title: line(EMOJI.warn, "ᴀᴘɪ ʜᴀᴛᴀ"),
-            description: line(
-              EMOJI.warn,
-              err?.message || "FiveM API bağlantı hatası"
-            )
-          })
-        );
+        console.error("TAG CMD ERROR:", err);
+        return i.editReply({
+          embeds: [
+            createEmbed(guild, {
+              title: line(EMOJI.warn, "ᴀᴘɪ ʜᴀᴛᴀ"),
+              description: line(EMOJI.warn, err?.message || "FiveM API bağlantı hatası")
+            })
+          ]
+        });
       }
     }
 
-    // ===================== SES GİR =====================
-    if (cmd === "sesgir") {
-      const vc = message.member.voice.channel;
+    // ===================== /SESGİR =====================
+    if (i.commandName === "sesgir") {
+      const vc = i.member?.voice?.channel;
+
       if (!vc) {
-        return replyE(message, createEmbed(guild, {
-          title: line(EMOJI.warn, "ʜᴀᴛᴀ"),
-          description: "Ses kanalında değilsin."
-        }));
+        return i.reply({
+          embeds: [
+            createEmbed(guild, {
+              title: line(EMOJI.warn, "ʜᴀᴛᴀ"),
+              description: "Ses kanalında değilsin."
+            })
+          ],
+          flags: 64
+        });
       }
 
       joinVoiceChannel({
@@ -369,14 +388,22 @@ client.on("messageCreate", async (message) => {
         adapterCreator: guild.voiceAdapterCreator
       });
 
-      return replyE(message, createEmbed(guild, {
-        title: line(EMOJI.success, "ꜱᴇꜱ"),
-        description: "Ses kanalına girildi."
-      }));
+      return i.reply({
+        embeds: [
+          createEmbed(guild, {
+            title: line(EMOJI.success, "ꜱᴇꜱ"),
+            description: "Ses kanalına girildi."
+          })
+        ]
+      });
     }
-
   } catch (err) {
-    console.error("CMD ERROR:", err);
+    console.error("INTERACTION ERROR:", err);
+    if (i.deferred || i.replied) {
+      await i.editReply("❌ Bir hata oluştu.").catch(() => {});
+    } else {
+      await i.reply({ content: "❌ Bir hata oluştu.", flags: 64 }).catch(() => {});
+    }
   }
 });
 

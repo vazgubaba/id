@@ -19,7 +19,6 @@ const {
 } = require("discord.js");
 
 const { joinVoiceChannel } = require("@discordjs/voice");
-const { getServerByEndpoint } = require("fivem-server-api");
 
 // ===================== ENV / TOKEN =====================
 const TOKEN = (
@@ -117,12 +116,47 @@ function createEmbed(guild, { title, description, fields, image }) {
   return e;
 }
 
-// ===================== FIVEM API (fivem-server-api paketi ile) =====================
+// ===================== FIVEM API (resmi Cfx.re endpoint, doğrudan fetch) =====================
 let lastPlayersFetchAt = 0;
 let cachedServerData = null;
 
 function cleanFiveMName(name = "") {
   return String(name).replace(/\^\d/g, "").toLowerCase();
+}
+
+// Eski "fivem-server-api" paketi, FiveM'in resmi servers-frontend endpoint'ini
+// Cloudflare botu korumasından geçmeyen çıplak bir istekle çağırıyordu, bu yüzden
+// 403 alıp veri çekemiyordu. Aşağıdaki fonksiyon aynı endpoint'e gerçek bir tarayıcı
+// gibi görünen header'larla (User-Agent, Accept, Referer) doğrudan istek atar.
+async function fetchFiveMServerRaw(code, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(
+      `https://servers-frontend.fivem.net/api/servers/single/${code}`,
+      {
+        signal: controller.signal,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          Accept: "application/json, text/plain, */*",
+          "Accept-Language": "en-US,en;q=0.9",
+          Referer: "https://servers.fivem.net/",
+          Origin: "https://servers.fivem.net"
+        }
+      }
+    );
+
+    if (!res.ok) {
+      throw new Error(`FiveM API HTTP ${res.status}`);
+    }
+
+    const json = await res.json();
+    return json;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function getServerPlayersCached() {
@@ -132,9 +166,16 @@ async function getServerPlayersCached() {
     return cachedServerData;
   }
 
-  const result = await getServerByEndpoint(CFX_CODE, 10000);
+  let result;
+  try {
+    result = await fetchFiveMServerRaw(CFX_CODE, 10000);
+  } catch (err) {
+    throw new Error(
+      `Sunucu bulunamadı (CFX kodu: ${CFX_CODE}). Kod yanlış olabilir, sunucu offline ya da FiveM API geçici olarak erişilemiyor. (${err.message})`
+    );
+  }
 
-  if (!result) {
+  if (!result || !result.Data) {
     throw new Error(`Sunucu bulunamadı (CFX kodu: ${CFX_CODE}). Kod yanlış olabilir ya da sunucu offline.`);
   }
 

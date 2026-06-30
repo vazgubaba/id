@@ -185,7 +185,15 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("sesgir")
-    .setDescription("Botu bulunduğun ses kanalına davet eder")
+    .setDescription("Botu bulunduğun ses kanalına davet eder"),
+
+  new SlashCommandBuilder()
+    .setName("sestopla")
+    .setDescription("Sunucuda seste olan herkesi senin bulunduğun ses kanalına toplar"),
+
+  new SlashCommandBuilder()
+    .setName("kisi")
+    .setDescription("FiveM sunucusundaki tüm oyuncuları (ID ve isim) listeler")
 ].map((c) => c.toJSON());
 
 async function registerCommands(clientId) {
@@ -360,6 +368,138 @@ client.on("interactionCreate", async (i) => {
           })
         ]
       });
+    }
+
+    // ===================== /SESTOPLA =====================
+    if (i.commandName === "sestopla") {
+      const vc = i.member?.voice?.channel;
+
+      if (!vc) {
+        return i.reply({
+          embeds: [
+            createEmbed(guild, {
+              title: line(EMOJI.warn, "ʜᴀᴛᴀ"),
+              description: "Önce bir ses kanalına girmelisin."
+            })
+          ],
+          flags: 64
+        });
+      }
+
+      const me = guild.members.me;
+      if (!me?.permissions?.has("MoveMembers")) {
+        return i.reply({
+          embeds: [
+            createEmbed(guild, {
+              title: line(EMOJI.lock, "ʏᴇᴛᴋɪ ʏᴏᴋ"),
+              description: "Botun **Üyeleri Taşı (Move Members)** yetkisi yok."
+            })
+          ],
+          flags: 64
+        });
+      }
+
+      await i.deferReply();
+
+      const voiceChannels = guild.channels.cache.filter(
+        (c) => c.isVoiceBased?.() && c.id !== vc.id
+      );
+
+      let moved = 0;
+      let failed = 0;
+
+      for (const [, channel] of voiceChannels) {
+        const members = [...channel.members.values()];
+        for (const member of members) {
+          if (member.id === client.user.id) continue;
+          try {
+            await member.voice.setChannel(vc);
+            moved++;
+          } catch (err) {
+            failed++;
+          }
+        }
+      }
+
+      return i.editReply({
+        embeds: [
+          createEmbed(guild, {
+            title: line(EMOJI.success, "ꜱᴇꜱ ᴛᴏᴘʟᴀᴍᴀ"),
+            description:
+              `${EMOJI.right} ・ **${moved}** kişi <#${vc.id}> kanalına taşındı.` +
+              (failed ? `\n${EMOJI.warn} ・ **${failed}** kişi taşınamadı.` : "")
+          })
+        ]
+      });
+    }
+
+    // ===================== /KISI (FiveM) =====================
+    if (i.commandName === "kisi") {
+      await i.deferReply();
+
+      try {
+        const json = await getServerPlayersCached();
+        const players = json?.Data?.players || [];
+
+        if (!players.length) {
+          return i.editReply({
+            embeds: [
+              createEmbed(guild, {
+                title: line(EMOJI.warn, "ʙᴏꜱ"),
+                description: line(EMOJI.warn, "Sunucuda kimse yok.")
+              })
+            ]
+          });
+        }
+
+        const lines = players.map(
+          (p) => `${EMOJI.right} ・ \`${p.id}\` **${p.name}**`
+        );
+
+        // Discord embed field value limiti 1024 karakter, bu yüzden listeyi parçalara bölüyoruz
+        const fields = [];
+        let chunk = "";
+        let part = 1;
+
+        for (const l of lines) {
+          if ((chunk + "\n" + l).length > 1000) {
+            fields.push({
+              name: part === 1 ? line(EMOJI.fivem, "ᴏʏᴜɴᴄᴜ ʟɪꜱᴛᴇꜱɪ") : `\u200b`,
+              value: chunk
+            });
+            chunk = l;
+            part++;
+          } else {
+            chunk = chunk ? chunk + "\n" + l : l;
+          }
+        }
+        if (chunk) {
+          fields.push({
+            name: part === 1 ? line(EMOJI.fivem, "ᴏʏᴜɴᴄᴜ ʟɪꜱᴛᴇꜱɪ") : `\u200b`,
+            value: chunk
+          });
+        }
+
+        return i.editReply({
+          embeds: [
+            createEmbed(guild, {
+              title: line(EMOJI.fivem, "ꜰɪᴠᴇᴍ ᴋɪꜱɪ ʟɪꜱᴛᴇꜱɪ"),
+              description: `${EMOJI.success} ・ Toplam: **${players.length} kişi**`,
+              fields
+            })
+          ]
+        });
+      } catch (err) {
+        console.error("KISI CMD ERROR:", err);
+        return i.editReply({
+          embeds: [
+            createEmbed(guild, {
+              title: line(EMOJI.warn, "ᴀᴘɪ ʜᴀᴛᴀ"),
+              description: line(EMOJI.warn, err?.message || "FiveM API bağlantı hatası")
+            })
+          ]
+        });
+      }
     }
   } catch (err) {
     console.error("INTERACTION ERROR:", err);
